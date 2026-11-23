@@ -3,9 +3,10 @@ import re
 import time
 import unicodedata
 import zipfile
-import xml.etree.ElementTree as ET
 from datetime import datetime
+from urllib.parse import urljoin
 
+from bs4 import BeautifulSoup
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -14,17 +15,16 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Auditor SIRE + CompraAPP + SSCO", layout="wide")
-st.title("Extractor SIRE Compras (Formato CompraAPP), XML y Control SSCO")
+st.title("Extractor SIRE Compras (Formato CompraAPP) y Control SSCO")
 
 # --- CONSTANTES ---
-URLS_SSCO = {
+URLS_SSCO_HTML = {
     "SSCO_DIRECTO": "https://www.sunat.gob.pe/padronesnotificaciones/sujeSinCapacidadOperativa.html",
     "SSCO_VINCULADO_ART12": "https://www.sunat.gob.pe/padronesnotificaciones/relacion-ssco.html",
 }
 
-NS_UBL = {
-    "cac": "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2",
-    "cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
+URLS_SSCO_XLSX_DIRECTO = {
+    "SSCO_DIRECTO": "https://www.sunat.gob.pe/padronesnotificaciones/ssco/sujesincapacidadOperativa.xlsx",
 }
 
 COLUMNAS_COMPRAAPP_61 = [
@@ -54,13 +54,13 @@ ANCHOS_BASE = {
     "Codigo": 14.0, "B.I.O.G y E. (A)": 15.5, "B.I.O.G.y E. y NO GRA. (B)": 24.5,
     "B.I.O.G.sin D.C.FIS(C)": 20.5, "AD. NO GRAV.": 14.5, "I.S.C.": 10.0,
     "IGV (A)": 13.5, "IGV (B)": 13.5, "IGV (C)": 13.5, "OTROS TRIB.": 13.5,
-    "IMP. BOLSA": 12.5, "Moneda": 9.5, "TC": 11.0, "Glosa": 65.0,
+    "IMP. BOLSA": 12.5, "Moneda": 9.5, "TC": 11.0, "Glosa": 55.0,
     "R.Doc": 9.5, "R.numero": 15.0, "R.Fecha": 12.5, "RUC": 14.0,
     "R.Social": 45.0, "Tip.Doc.Iden": 13.0, "Alerta SSCO": 22.0, "Fecha Pub. SSCO": 16.5,
 }
 
 
-# --- UTILIDADES DE TEXTO Y PARSEO ---
+# --- UTILIDADES ---
 def norm_txt(s: str) -> str:
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"\s+", " ", s).strip().lower()
@@ -136,6 +136,61 @@ def limpiar_num_doc(val) -> str:
 def limpiar_nombre_archivo(texto: str) -> str:
     limpio = re.sub(r'[\\/*?:"<>|]', "", str(texto)).strip()
     return re.sub(r"\s+", " ", limpio)
+
+
+def generar_glosa_automatica(
+    doc: str,
+    numero: str,
+    rsoc: str,
+    r_numero: str,
+    bi_a,
+    bi_b,
+    bi_c,
+    ad_ng,
+) -> str:
+    rsoc_u = norm_txt(rsoc).upper()
+    rsoc_limpia = rsoc.strip()
+
+    if doc == "07":
+        ref = f" REF. {r_numero}" if r_numero else ""
+        return f"NOTA DE CREDITO{ref} - {rsoc_limpia}".strip(" -")
+    if doc == "08":
+        ref = f" REF. {r_numero}" if r_numero else ""
+        return f"NOTA DE DEBITO{ref} - {rsoc_limpia}".strip(" -")
+    if doc == "14":
+        return f"RECIBO SERVICIO PUBLICO {numero} - {rsoc_limpia}".strip(" -")
+    if doc == "02":
+        return f"RECIBO POR HONORARIOS {numero} - {rsoc_limpia}".strip(" -")
+    if doc in ("50", "52", "53", "54"):
+        return f"IMPORTACION / DUA {numero} - {rsoc_limpia}".strip(" -")
+
+    palabras_banco = (
+        "BANCO ", "BBVA", "INTERBANK", "SCOTIABANK", "BANBIF",
+        "MIBANCO", "BCP", "CAJA ", "FINANCIERA ", "CITIBANK", "PICHINCHA",
+    )
+    if any(p in rsoc_u for p in palabras_banco) and ad_ng and not bi_a:
+        return f"COMISION / GASTO BANCARIO {numero} - {rsoc_limpia}".strip(" -")
+
+    palabras_telco = ("TELEFONICA", "AMERICA MOVIL", "ENTEL", "VIETTEL", "BITEL", "CLARO", "WIN EMPRESAS")
+    if any(p in rsoc_u for p in palabras_telco):
+        return f"SERVICIO TELECOMUNICACIONES {numero} - {rsoc_limpia}".strip(" -")
+
+    palabras_serv_pub = ("LUZ DEL SUR", "PLUZ", "ENEL ", "SEDAPAL", "CALIDDA", "GAS NATURAL", "ELECTRO")
+    if any(p in rsoc_u for p in palabras_serv_pub):
+        return f"SERVICIO PUBLICO {numero} - {rsoc_limpia}".strip(" -")
+
+    palabras_comb = ("PRIMAX", "REPSOL", "PETROPERU", "PECSA", "GRIFO", "ESTACION DE SERVICIO")
+    if any(p in rsoc_u for p in palabras_comb):
+        return f"COMPRA COMBUSTIBLE {numero} - {rsoc_limpia}".strip(" -")
+
+    if any(x is not None for x in (bi_a, bi_b, bi_c)):
+        pref = "COMPRA BOLETA" if doc == "03" else "COMPRA GRAVADA"
+        return f"{pref} {numero} - {rsoc_limpia}".strip(" -")
+
+    if ad_ng is not None:
+        return f"ADQUISICION NO GRAVADA {numero} - {rsoc_limpia}".strip(" -")
+
+    return f"COMPRA {numero} - {rsoc_limpia}".strip(" -")
 
 
 # --- 1. CLIENTE API SIRE ---
@@ -246,59 +301,127 @@ class SunatSireClient:
         return df
 
 
-# --- 2. PADRÓN SSCO (CON CACHÉ DE 6 HORAS) ---
+# --- 2. PADRÓN SSCO (EXCEL OFICIAL + ENLACES EN PORTAL SUNAT) ---
+def _parsear_df_ssco_crudo(df_raw: pd.DataFrame, tipo_lista: str) -> pd.DataFrame:
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame(columns=["ruc_ssco", "alerta_ssco", "fecha_publicacion_ssco"])
+
+    header_idx = None
+    for idx in range(min(15, len(df_raw))):
+        vals = [str(x).upper() for x in df_raw.iloc[idx].tolist() if pd.notna(x)]
+        if any("RUC" in v for v in vals) and any(
+            k in v for v in vals for k in ("RAZ", "NOMBRE", "RESOLUCI", "SOCIEDAD", "DENOMINACI")
+        ):
+            header_idx = idx
+            break
+
+    if header_idx is not None:
+        headers = [
+            str(x).strip() if pd.notna(x) else f"col_{i}"
+            for i, x in enumerate(df_raw.iloc[header_idx].tolist())
+        ]
+        df = df_raw.iloc[header_idx + 1:].copy()
+        df.columns = headers
+    else:
+        df = df_raw.copy()
+
+    # Seleccionar la columna del RUC del proveedor SSCO (evitando la del representante legal)
+    col_ruc = None
+    for c in df.columns:
+        cu = str(c).upper()
+        if "RUC" in cu and not any(ex in cu for ex in ("REPRESENTANTE", "SOCIO", "TITULAR")):
+            col_ruc = c
+            break
+
+    if col_ruc is None:
+        for c in df.columns:
+            s = df[c].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+            if s.str.fullmatch(r"\d{11}", na=False).sum() > 0:
+                col_ruc = c
+                break
+
+    if col_ruc is None:
+        return pd.DataFrame(columns=["ruc_ssco", "alerta_ssco", "fecha_publicacion_ssco"])
+
+    col_fecha = next((c for c in df.columns if "PUBLICACI" in str(c).upper()), None)
+
+    def fmt_fecha(v):
+        if v is None or pd.isna(v):
+            return ""
+        if isinstance(v, (datetime, pd.Timestamp)):
+            return v.strftime("%d/%m/%Y")
+        s = str(v).strip()
+        if re.fullmatch(r"\d{5}(\.0)?", s):
+            try:
+                return pd.to_datetime(float(s), origin="1899-12-30", unit="D").strftime("%d/%m/%Y")
+            except Exception:
+                return s
+        return s
+
+    rucs = df[col_ruc].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+    fechas = df[col_fecha].apply(fmt_fecha) if col_fecha else ""
+    out = pd.DataFrame({
+        "ruc_ssco": rucs,
+        "alerta_ssco": tipo_lista,
+        "fecha_publicacion_ssco": fechas,
+    })
+    return out[out["ruc_ssco"].str.fullmatch(r"\d{11}", na=False)]
+
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def obtener_padron_ssco() -> tuple[pd.DataFrame, list[str]]:
     registros = []
     errores = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    for tipo_lista, url in URLS_SSCO.items():
+    # 1) Descargar Excel directo conocido de SUNAT
+    for tipo_lista, url_xlsx in URLS_SSCO_XLSX_DIRECTO.items():
         try:
-            resp = requests.get(url, headers=headers, timeout=25)
+            r_x = requests.get(url_xlsx, headers=headers, timeout=30)
+            if r_x.ok and len(r_x.content) > 1000:
+                df_raw = pd.read_excel(io.BytesIO(r_x.content), header=None)
+                parsed = _parsear_df_ssco_crudo(df_raw, tipo_lista)
+                if not parsed.empty:
+                    registros.append(parsed)
+        except Exception as e:
+            errores.append(f"{tipo_lista} (XLSX): {e}")
+
+    # 2) Inspeccionar las dos páginas HTML oficiales (buscar enlaces .xlsx/.xls y tablas HTML)
+    for tipo_lista, url_html in URLS_SSCO_HTML.items():
+        try:
+            resp = requests.get(url_html, headers=headers, timeout=25)
             resp.raise_for_status()
             resp.encoding = resp.apparent_encoding or "utf-8"
+            soup = BeautifulSoup(resp.text, "lxml")
 
-            try:
-                tablas = pd.read_html(io.StringIO(resp.text))
-            except ValueError:
-                continue
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if href.lower().endswith((".xlsx", ".xls")):
+                    url_excel = urljoin(url_html, href)
+                    if url_excel in URLS_SSCO_XLSX_DIRECTO.values() and any(
+                        r["alerta_ssco"].eq(tipo_lista).any() for r in registros
+                    ):
+                        continue
+                    try:
+                        r_ex = requests.get(url_excel, headers=headers, timeout=30)
+                        if r_ex.ok and len(r_ex.content) > 500:
+                            df_raw = pd.read_excel(io.BytesIO(r_ex.content), header=None)
+                            parsed = _parsear_df_ssco_crudo(df_raw, tipo_lista)
+                            if not parsed.empty:
+                                registros.append(parsed)
+                    except Exception:
+                        pass
 
-            for df in tablas:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = [" ".join(str(x) for x in col).strip() for col in df.columns]
-
-                if all(isinstance(c, int) for c in df.columns) and len(df) > 1:
-                    primera_fila = [str(x).strip() for x in df.iloc[0].tolist()]
-                    if any("RUC" in x.upper() for x in primera_fila):
-                        df = df.iloc[1:].copy()
-                        df.columns = primera_fila
-
-                col_ruc = next((c for c in df.columns if str(c).strip().upper() == "RUC"), None)
-                if col_ruc is None:
-                    col_ruc = next((c for c in df.columns if "RUC" in str(c).upper()), None)
-
-                if col_ruc is not None:
-                    col_fecha = next(
-                        (c for c in df.columns if "PUBLICACI" in str(c).upper()),
-                        None,
-                    )
-                    rucs = (
-                        df[col_ruc]
-                        .astype(str)
-                        .str.replace(r"\.0$", "", regex=True)
-                        .str.strip()
-                    )
-                    fechas = df[col_fecha].astype(str).str.strip() if col_fecha else ""
-
-                    tmp = pd.DataFrame({
-                        "ruc_ssco": rucs,
-                        "alerta_ssco": tipo_lista,
-                        "fecha_publicacion_ssco": fechas,
-                    })
-                    tmp = tmp[tmp["ruc_ssco"].str.fullmatch(r"\d{11}", na=False)]
-                    if not tmp.empty:
-                        registros.append(tmp)
+            ya_cargado = any(r["alerta_ssco"].eq(tipo_lista).any() for r in registros)
+            if not ya_cargado:
+                try:
+                    tablas = pd.read_html(io.StringIO(resp.text))
+                    for df_t in tablas:
+                        parsed = _parsear_df_ssco_crudo(df_t, tipo_lista)
+                        if not parsed.empty:
+                            registros.append(parsed)
+                except ValueError:
+                    pass
         except Exception as e:
             errores.append(f"{tipo_lista}: {e}")
 
@@ -306,72 +429,10 @@ def obtener_padron_ssco() -> tuple[pd.DataFrame, list[str]]:
         return pd.DataFrame(columns=["ruc_ssco", "alerta_ssco", "fecha_publicacion_ssco"]), errores
 
     padron = pd.concat(registros, ignore_index=True).drop_duplicates(subset=["ruc_ssco"])
-    return padron, errores
+    return padron, []
 
 
-# --- 3. PARSER DE XML UBL 2.1 ---
-def leer_xml_bytes(contenido: bytes) -> dict | None:
-    try:
-        root = ET.fromstring(contenido)
-        ruc_emisor = root.findtext(
-            ".//cac:AccountingSupplierParty/cac:Party/cac:PartyIdentification/cbc:ID",
-            default="",
-            namespaces=NS_UBL,
-        ).strip()
-        id_doc = root.findtext("./cbc:ID", default="", namespaces=NS_UBL).strip()
-
-        serie, numero = "", ""
-        if "-" in id_doc:
-            partes = id_doc.split("-", 1)
-            serie = partes[0].strip().upper()
-            numero = limpiar_num_doc(partes[1])
-
-        lineas = (
-            root.findall(".//cac:InvoiceLine", NS_UBL)
-            or root.findall(".//cac:CreditNoteLine", NS_UBL)
-            or root.findall(".//cac:DebitNoteLine", NS_UBL)
-        )
-        descripciones = []
-        for linea in lineas:
-            desc = " ".join(
-                d.text.strip()
-                for d in linea.findall(".//cac:Item/cbc:Description", NS_UBL)
-                if d.text
-            )
-            if desc:
-                descripciones.append(desc)
-
-        return {
-            "clave_cruce": f"{ruc_emisor}|{serie}|{numero}",
-            "ruc_xml": ruc_emisor,
-            "comprobante_xml": id_doc,
-            "descripcion_items": " ; ".join(descripciones),
-        }
-    except Exception:
-        return None
-
-
-def procesar_archivos_xml(archivos_subidos) -> pd.DataFrame:
-    filas = []
-    for archivo in archivos_subidos:
-        nombre = archivo.name.lower()
-        if nombre.endswith(".xml"):
-            data = leer_xml_bytes(archivo.read())
-            if data:
-                filas.append(data)
-        elif nombre.endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(archivo.read())) as z:
-                for item in z.namelist():
-                    if item.lower().endswith(".xml") and not item.startswith("__MACOSX"):
-                        data = leer_xml_bytes(z.read(item))
-                        if data:
-                            filas.append(data)
-    if not filas:
-        return pd.DataFrame(columns=["clave_cruce", "ruc_xml", "comprobante_xml", "descripcion_items"])
-    return pd.DataFrame(filas).drop_duplicates(subset=["clave_cruce"])
-
-
-# --- 4. TRANSFORMADOR A FORMATO COMPRAAPP + FILTRO INTELIGENTE ---
+# --- 3. TRANSFORMADOR A FORMATO COMPRAAPP + FILTRO INTELIGENTE ---
 def construir_compraapp(df_sire: pd.DataFrame) -> pd.DataFrame:
     c_fec_em = buscar_col(df_sire, ["fecha de emision", "fecha emision"], excluir=["modificado"])
     c_fec_vc = buscar_col(df_sire, ["fecha vcto/pago", "fecha vcto", "vencimiento"])
@@ -464,11 +525,13 @@ def construir_compraapp(df_sire: pd.DataFrame) -> pd.DataFrame:
         r_numero = f"{r_ser}-{r_nro}" if (r_ser and r_nro) else (r_ser or r_nro)
         r_fecha = parse_fecha(g(c_r_fec))
 
-        glosa = (
-            str(row["descripcion_items"]).strip()
-            if ("descripcion_items" in df_sire.columns and pd.notna(row["descripcion_items"]))
-            else ""
-        )
+        bi_a = parse_monto(g(c_bi_a), tc_val, es_usd, es_nc)
+        bi_b = parse_monto(g(c_bi_b), tc_val, es_usd, es_nc)
+        bi_c = parse_monto(g(c_bi_c), tc_val, es_usd, es_nc)
+        ad_ng = parse_monto(g(c_ng), tc_val, es_usd, es_nc)
+
+        glosa = generar_glosa_automatica(doc, numero, rsoc_prov, r_numero, bi_a, bi_b, bi_c, ad_ng)
+
         alerta_ssco = (
             str(row["alerta_ssco"]).strip()
             if ("alerta_ssco" in df_sire.columns and pd.notna(row["alerta_ssco"]))
@@ -488,10 +551,10 @@ def construir_compraapp(df_sire: pd.DataFrame) -> pd.DataFrame:
             "Fec.Doc": fec_doc,
             "Fec.Venc.": fec_venc,
             "Codigo": ruc_prov or None,
-            "B.I.O.G y E. (A)": parse_monto(g(c_bi_a), tc_val, es_usd, es_nc),
-            "B.I.O.G.y E. y NO GRA. (B)": parse_monto(g(c_bi_b), tc_val, es_usd, es_nc),
-            "B.I.O.G.sin D.C.FIS(C)": parse_monto(g(c_bi_c), tc_val, es_usd, es_nc),
-            "AD. NO GRAV.": parse_monto(g(c_ng), tc_val, es_usd, es_nc),
+            "B.I.O.G y E. (A)": bi_a,
+            "B.I.O.G.y E. y NO GRA. (B)": bi_b,
+            "B.I.O.G.sin D.C.FIS(C)": bi_c,
+            "AD. NO GRAV.": ad_ng,
             "I.S.C.": parse_monto(g(c_isc), tc_val, es_usd, es_nc),
             "IGV (A)": parse_monto(g(c_igv_a), tc_val, es_usd, es_nc),
             "IGV (B)": parse_monto(g(c_igv_b), tc_val, es_usd, es_nc),
@@ -542,7 +605,7 @@ def filtrar_columnas_con_datos(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str
     return df[cols_con_datos].copy(), cols_vacias
 
 
-# --- 5. GENERADOR EXCEL ESTILO COMPRAAPP ---
+# --- 4. GENERADOR EXCEL ESTILO COMPRAAPP ---
 def escribir_hoja_compraapp(ws, df_hoja: pd.DataFrame):
     font_hdr = Font(name="Calibri", size=11, bold=True)
     font_data = Font(name="Calibri", size=11, bold=False)
@@ -617,7 +680,6 @@ def generar_excel_compraapp(df_formato: pd.DataFrame, omitir_vacias: bool = True
     ws.title = "Hoja 1"
     escribir_hoja_compraapp(ws, df_export)
 
-    # Crear segunda pestaña solo si realmente se detectaron proveedores SSCO
     if "Alerta SSCO" in df_formato.columns:
         df_ssco = df_formato[df_formato["Alerta SSCO"].notna()]
         if not df_ssco.empty:
@@ -639,7 +701,7 @@ with st.sidebar:
     client_id = st.text_input("API Client ID (SIRE)")
     client_secret = st.text_input("API Client Secret (SIRE)", type="password")
     periodo = st.text_input("Periodo (AAAAMM)", value="202611", max_chars=6)
-    btn_descargar = st.button("1. Descargar Propuesta SIRE", type="primary", use_container_width=True)
+    btn_descargar = st.button("Descargar Propuesta SIRE", type="primary", use_container_width=True)
 
 if "df_sire" not in st.session_state:
     st.session_state.df_sire = None
@@ -653,7 +715,7 @@ if btn_descargar:
     if not all([ruc, usuario_sol, clave_sol, client_id, client_secret, periodo]):
         st.error("Completa todas las credenciales y el periodo antes de consultar.")
     else:
-        with st.spinner("Consultando API SIRE de SUNAT y cruzando padrón SSCO..."):
+        with st.spinner("Consultando API SIRE de SUNAT, generando glosas y cruzando padrón SSCO..."):
             try:
                 cliente = SunatSireClient(ruc, usuario_sol, clave_sol, client_id, client_secret)
                 cliente.autenticar()
@@ -670,12 +732,6 @@ if btn_descargar:
                         st.session_state.razon_contribuyente = ruc.strip()
 
                     col_ruc_prov = buscar_col(df_sire, ["nro doc identidad", "nro doc. identidad"], excluir=["tipo"])
-                    col_serie = buscar_col(df_sire, ["serie del cdp", "serie"], excluir=["modificado"])
-                    col_num = buscar_col(
-                        df_sire,
-                        ["nro cp o doc. nro inicial (rango)", "nro cp o doc", "nro inicial"],
-                        excluir=["modificado", "final"],
-                    )
 
                     padron_ssco, errores_ssco = obtener_padron_ssco()
                     st.session_state.total_padron_ssco = len(padron_ssco)
@@ -691,21 +747,12 @@ if btn_descargar:
                             how="left",
                         ).drop(columns=["ruc_ssco"], errors="ignore")
 
-                        if col_serie and col_num:
-                            df_sire["clave_cruce"] = (
-                                df_sire[col_ruc_prov].str.strip()
-                                + "|"
-                                + df_sire[col_serie].astype(str).str.strip().str.upper()
-                                + "|"
-                                + df_sire[col_num].apply(limpiar_num_doc)
-                            )
-
                     st.session_state.df_sire = df_sire
-                    st.success(f"Propuesta cargada: {len(df_sire)} comprobantes encontrados.")
+                    st.success(f"Propuesta cargada: {len(df_sire)} comprobantes procesados.")
             except Exception as e:
                 st.error(f"Error en la consulta: {e}")
 
-# --- VISUALIZACIÓN, CRUCE CON XML Y EXPORTACIÓN COMPRAAPP ---
+# --- RESULTADOS Y EXPORTACIÓN COMPRAAPP ---
 if st.session_state.df_sire is not None:
     df_trabajo = st.session_state.df_sire.copy()
 
@@ -719,30 +766,10 @@ if st.session_state.df_sire is not None:
     if total_ssco > 0:
         st.error(f"Se detectaron {total_ssco} comprobante(s) de proveedores en la lista SSCO de SUNAT.")
 
-    st.divider()
-    st.subheader("2. Agregar descripciones (Glosa) desde archivos XML")
-    archivos_xml = st.file_uploader(
-        "Sube uno o varios archivos .xml o un .zip con los comprobantes del periodo",
-        type=["xml", "zip"],
-        accept_multiple_files=True,
-    )
-
-    if archivos_xml:
-        df_xml = procesar_archivos_xml(archivos_xml)
-        if not df_xml.empty and "clave_cruce" in df_trabajo.columns:
-            df_trabajo = df_trabajo.merge(
-                df_xml[["clave_cruce", "descripcion_items"]],
-                on="clave_cruce",
-                how="left",
-            )
-            coincidencias = int(df_trabajo["descripcion_items"].notna().sum())
-            st.info(f"Se vincularon descripciones (Glosa) en {coincidencias} de {total_docs} comprobantes.")
-
-    # Transformar al formato CompraAPP
     df_compraapp = construir_compraapp(df_trabajo)
 
     st.divider()
-    st.subheader("3. Vista previa formato CompraAPP")
+    st.subheader("Vista previa formato CompraAPP")
     omitir_vacias = st.checkbox(
         "Omitir automáticamente columnas vacías en el Excel",
         value=True,
@@ -759,7 +786,6 @@ if st.session_state.df_sire is not None:
         + (f" — Omitidas por estar vacías: {len(cols_omitidas)}" if omitir_vacias else "")
     )
 
-    # Preparar vista previa con fechas legibles dd/mm/yyyy
     df_preview = df_compraapp[cols_incluidas].copy()
     for col_f in COLS_FECHA.intersection(df_preview.columns):
         df_preview[col_f] = df_preview[col_f].apply(
