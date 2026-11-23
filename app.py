@@ -129,7 +129,6 @@ class SunatSireClient:
         except pd.errors.EmptyDataError:
             df = pd.DataFrame()
 
-        # Eliminar columna vacía final si las filas terminan con '|'
         df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
         return df
 
@@ -145,20 +144,54 @@ def obtener_padron_ssco() -> tuple[pd.DataFrame, list[str]]:
         try:
             resp = requests.get(url, headers=headers, timeout=25)
             resp.raise_for_status()
-            tablas = pd.read_html(io.StringIO(resp.text), dtype=str)
+            resp.encoding = resp.apparent_encoding or "utf-8"
+
+            try:
+                tablas = pd.read_html(io.StringIO(resp.text))
+            except ValueError:
+                # La página no tiene tabla publicada aún (frecuente en la lista Art. 12)
+                continue
+
             for df in tablas:
-                cols_ruc = [c for c in df.columns if "RUC" in str(c).upper()]
-                if cols_ruc:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [" ".join(str(x) for x in col).strip() for col in df.columns]
+
+                if all(isinstance(c, int) for c in df.columns) and len(df) > 1:
+                    primera_fila = [str(x).strip() for x in df.iloc[0].tolist()]
+                    if any("RUC" in x.upper() for x in primera_fila):
+                        df = df.iloc[1:].copy()
+                        df.columns = primera_fila
+
+                col_ruc = next((c for c in df.columns if str(c).strip().upper() == "RUC"), None)
+                if col_ruc is None:
+                    col_ruc = next((c for c in df.columns if "RUC" in str(c).upper()), None)
+
+                if col_ruc is not None:
+                    col_fecha = next(
+                        (c for c in df.columns if "PUBLICACI" in str(c).upper()),
+                        None,
+                    )
+                    rucs = (
+                        df[col_ruc]
+                        .astype(str)
+                        .str.replace(r"\.0$", "", regex=True)
+                        .str.strip()
+                    )
+                    fechas = df[col_fecha].astype(str).str.strip() if col_fecha else ""
+
                     tmp = pd.DataFrame({
-                        "ruc_ssco": df[cols_ruc[0]].astype(str).str.strip(),
+                        "ruc_ssco": rucs,
                         "alerta_ssco": tipo_lista,
+                        "fecha_publicacion_ssco": fechas,
                     })
-                    registros.append(tmp)
+                    tmp = tmp[tmp["ruc_ssco"].str.fullmatch(r"\d{11}", na=False)]
+                    if not tmp.empty:
+                        registros.append(tmp)
         except Exception as e:
             errores.append(f"{tipo_lista}: {e}")
 
     if not registros:
-        return pd.DataFrame(columns=["ruc_ssco", "alerta_ssco"]), errores
+        return pd.DataFrame(columns=["ruc_ssco", "alerta_ssco", "fecha_publicacion_ssco"]), errores
 
     padron = pd.concat(registros, ignore_index=True).drop_duplicates(subset=["ruc_ssco"])
     return padron, errores
@@ -250,6 +283,8 @@ with st.sidebar:
 
 if "df_sire" not in st.session_state:
     st.session_state.df_sire = None
+if "total_padron_ssco" not in st.session_state:
+    st.session_state.total_padron_ssco = 0
 
 # --- FLUJO PRINCIPAL ---
 if btn_descargar:
@@ -266,12 +301,15 @@ if btn_descargar:
                     st.warning("La propuesta del periodo consultado está vacía (0 comprobantes).")
                     st.session_state.df_sire = None
                 else:
-                    # Detectar columnas clave del archivo TXT de propuesta RCE
-                    col_ruc_prov = next((c for c in df_sire.columns if "Nro Doc Identidad" in c), None)
+                    col_ruc_prov = next(
+                        (c for c in df_sire.columns if "doc identidad" in c.lower() and "tipo" not in c.lower()),
+                        None,
+                    )
                     col_serie = next((c for c in df_sire.columns if "Serie" in c), None)
                     col_num = next((c for c in df_sire.columns if "Nro CP" in c), None)
 
                     padron_ssco, errores_ssco = obtener_padron_ssco()
+                    st.session_state.total_padron_ssco = len(padron_ssco)
                     if errores_ssco:
                         st.warning("Aviso al consultar listas SSCO: " + " | ".join(errores_ssco))
 
@@ -304,9 +342,10 @@ if st.session_state.df_sire is not None:
 
     total_docs = len(df_trabajo)
     total_ssco = int(df_trabajo["alerta_ssco"].notna().sum()) if "alerta_ssco" in df_trabajo.columns else 0
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Comprobantes en Propuesta RCE", total_docs)
-    c2.metric("Proveedores con Alerta SSCO", total_ssco)
+    c2.metric("RUCs verificados en Padrón SSCO", st.session_state.total_padron_ssco)
+    c3.metric("Proveedores con Alerta SSCO", total_ssco)
 
     st.divider()
     st.subheader("2. Agregar descripciones desde archivos XML")
